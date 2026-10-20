@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+prometheus-client
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+opentelemetry-instrumentation-fastapi
+psycopg[binary,pool]
+redis
+aio-pika

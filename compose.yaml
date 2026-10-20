@@ -1,0 +1,47 @@
+# Definicion autonoma del servicio: se incluye desde el docker-compose.yml de la plataforma.
+# Rutas relativas a esta carpeta, para poder moverla a su propio repositorio sin cambios.
+services:
+  test-fastapi-service:
+    build:
+      context: .
+    container_name: demo-test-fastapi-service
+    environment:
+      SERVICE_NAME: test-fastapi-service
+      SERVICE_PORT: "8083"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      DEPLOYMENT_ENVIRONMENT: development
+      DATABASE_URL: postgresql://${POSTGRES_USER:-demo}:${POSTGRES_PASSWORD:-demo}@postgres:5432/${POSTGRES_DB:-demo}
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-demo}:${RABBITMQ_PASSWORD:-demo}@rabbitmq:5672/
+      RABBITMQ_QUEUE: test.events
+    expose:
+      - "8083"
+    depends_on:
+      otel-collector:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8083/health/live', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    labels:
+      - traefik.enable=true
+      - 'traefik.http.routers.demo-test-fastapi.rule=PathPrefix(`/api/test`)'
+      - traefik.http.routers.demo-test-fastapi.entrypoints=web
+      - traefik.http.routers.demo-test-fastapi.middlewares=demo-ratelimit@docker,demo-inflight@docker,demo-secure-headers@docker
+      - traefik.http.routers.demo-test-fastapi.service=demo-test-fastapi
+      - traefik.http.services.demo-test-fastapi.loadbalancer.server.port=8083
+      - traefik.docker.network=demo-observability-net
+    networks:
+      - demo-net
+
+networks:
+  demo-net:
+    name: demo-observability-net
