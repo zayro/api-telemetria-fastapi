@@ -59,6 +59,27 @@ def get_auth_context(request: Request) -> dict:
     }
 
 
+@router.get("/api/test/public")
+async def test_public(request: Request):
+    started = time.perf_counter()
+    status = 200
+    auth = get_auth_context(request)
+    try:
+        structured_log(
+            request.app.state.logger,
+            "test_public_access",
+            authenticated=bool(auth["user"]),
+        )
+        return {
+            "ok": True,
+            "service": request.app.title,
+            "message": "Este endpoint es publico. No requiere autenticacion JWT.",
+            "auth": auth,
+        }
+    finally:
+        record_request(request.app.title, "/api/test/public", status, started)
+
+
 @router.get("/api/test")
 async def test(
     request: Request,
