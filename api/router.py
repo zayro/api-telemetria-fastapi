@@ -1,3 +1,4 @@
+import json
 import time
 from uuid import UUID
 
@@ -35,6 +36,29 @@ def current_trace_id() -> str | None:
     return format(context.trace_id, "032x") if context.is_valid else None
 
 
+def parse_roles(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [str(r) for r in data]
+        return [str(data)]
+    except Exception:
+        return [r.strip() for r in raw.split(",") if r.strip()]
+
+
+def get_auth_context(request: Request) -> dict:
+    user = request.headers.get("x-auth-user")
+    email = request.headers.get("x-auth-email")
+    roles = parse_roles(request.headers.get("x-auth-roles"))
+    return {
+        "user": user,
+        "email": email,
+        "roles": roles,
+    }
+
+
 @router.get("/api/test")
 async def test(
     request: Request,
@@ -43,16 +67,28 @@ async def test(
 ):
     started = time.perf_counter()
     status = 200
+    auth = get_auth_context(request)
     try:
         with trace.get_tracer(__name__).start_as_current_span(
             "test.business_logic"
         ) as span:
             span.set_attribute("demo.delay_ms", delay_ms)
+            if auth["user"]:
+                span.set_attribute("enduser.id", auth["user"])
+            if auth["email"]:
+                span.set_attribute("enduser.email", auth["email"])
+            if auth["roles"]:
+                span.set_attribute("enduser.role", ",".join(auth["roles"]))
+
             await request.app.state.container.simulate_test.execute(delay_ms)
 
             if fail == 1:
                 status = 500
-                structured_log(request.app.state.logger, "test_simulated_error")
+                structured_log(
+                    request.app.state.logger,
+                    "test_simulated_error",
+                    user=auth["user"],
+                )
                 return JSONResponse(
                     status_code=status,
                     content={
@@ -60,15 +96,24 @@ async def test(
                         "service": request.app.title,
                         "trace_id": current_trace_id(),
                         "error": "Error simulado para validar observabilidad.",
+                        "auth": auth,
                     },
                 )
 
-            structured_log(request.app.state.logger, "test_ok", delay_ms=delay_ms)
+            structured_log(
+                request.app.state.logger,
+                "test_ok",
+                delay_ms=delay_ms,
+                user=auth["user"],
+                email=auth["email"],
+                roles=auth["roles"],
+            )
             return {
                 "ok": True,
                 "service": request.app.title,
                 "trace_id": current_trace_id(),
                 "message": "pong",
+                "auth": auth,
             }
     finally:
         record_request(request.app.title, "/api/test", status, started)
@@ -78,14 +123,24 @@ async def test(
 async def create_item(item: ItemIn, request: Request):
     started = time.perf_counter()
     status = 201
+    auth = get_auth_context(request)
     try:
         created = await request.app.state.container.create_item.execute(item.name)
-        structured_log(request.app.state.logger, "item_created", item_id=created.id)
-        return {
+        structured_log(
+            request.app.state.logger,
+            "item_created",
+            item_id=created.id,
+            user=auth["user"],
+            roles=auth["roles"],
+        )
+        res = {
             "id": created.id,
             "name": created.name,
             "created_at": created.created_at.isoformat(),
         }
+        if auth["user"]:
+            res["created_by"] = auth["user"]
+        return res
     except Exception:
         status = 500
         raise
@@ -97,10 +152,20 @@ async def create_item(item: ItemIn, request: Request):
 async def publish_event(event: EventIn, request: Request):
     started = time.perf_counter()
     status = 202
+    auth = get_auth_context(request)
     try:
         event_id = await request.app.state.container.publish_event.execute(event.name)
-        structured_log(request.app.state.logger, "event_published", event_id=event_id)
-        return {"accepted": True, "event_id": event_id}
+        structured_log(
+            request.app.state.logger,
+            "event_published",
+            event_id=event_id,
+            user=auth["user"],
+            roles=auth["roles"],
+        )
+        res = {"accepted": True, "event_id": event_id}
+        if auth["user"]:
+            res["published_by"] = auth["user"]
+        return res
     except Exception:
         status = 500
         raise
