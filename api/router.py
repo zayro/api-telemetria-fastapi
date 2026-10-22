@@ -93,7 +93,7 @@ async def test(
         with trace.get_tracer(__name__).start_as_current_span(
             "test.business_logic"
         ) as span:
-            span.set_attribute("demo.delay_ms", delay_ms)
+            span.set_attribute("app.delay_ms", delay_ms)
             if auth["user"]:
                 span.set_attribute("enduser.id", auth["user"])
             if auth["email"]:

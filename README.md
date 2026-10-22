@@ -1,6 +1,6 @@
 # Servicio de prueba FastAPI
 
-Servicio HTTP del demo para probar observabilidad, persistencia, cache y
+Servicio HTTP del app para probar observabilidad, persistencia, cache y
 publicacion de eventos. Se expone hacia los clientes unicamente a traves de
 Traefik; dentro de Docker escucha en el puerto `8083`.
 
@@ -31,11 +31,11 @@ Las rutas de negocio conservan sus contratos:
 - `GET /api/test?delay_ms=100&fail=0`: respuesta `pong`; `delay_ms` acepta
   valores de 0 a 2000 ms y `fail=1` genera un error simulado para probar
   trazas, logs y metricas.
-- `POST /api/test/items` con `{"name":"demo"}`: crea un elemento en PostgreSQL,
+- `POST /api/test/items` con `{"name":"app"}`: crea un elemento en PostgreSQL,
   invalida el cache y responde `201`.
 - `GET /api/test/items`: consulta los ultimos 20 elementos usando cache-aside
   en Redis, con TTL de 30 segundos.
-- `POST /api/test/events` con `{"name":"demo"}`: registra el evento en la tabla
+- `POST /api/test/events` con `{"name":"app"}`: registra el evento en la tabla
   `test_events` de PostgreSQL, lo publica en la cola RabbitMQ configurada y
   responde `202` con `event_id`. Si la publicacion falla, el registro se elimina.
 - `GET /api/test/events`: lista los 20 eventos mas recientes.

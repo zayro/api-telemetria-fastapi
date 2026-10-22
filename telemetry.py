@@ -21,7 +21,7 @@ def setup_telemetry(service_name: str):
     resource = Resource.create(
         {
             "service.name": service_name,
-            "service.namespace": "demo-etapa1",
+            "service.namespace": "app-etapa1",
             "deployment.environment.name": environment,
         }
     )

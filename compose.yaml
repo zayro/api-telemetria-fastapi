@@ -4,15 +4,15 @@ services:
   test-fastapi-service:
     build:
       context: .
-    container_name: demo-test-fastapi-service
+    container_name: app-test-fastapi-service
     environment:
       SERVICE_NAME: test-fastapi-service
       SERVICE_PORT: "8083"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       DEPLOYMENT_ENVIRONMENT: development
-      DATABASE_URL: postgresql://${POSTGRES_USER:-demo}:${POSTGRES_PASSWORD:-demo}@postgres:5432/${POSTGRES_DB:-demo}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-app}
       REDIS_URL: redis://redis:6379/0
-      RABBITMQ_URL: amqp://${RABBITMQ_USER:-demo}:${RABBITMQ_PASSWORD:-demo}@rabbitmq:5672/
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-app}@rabbitmq:5672/
       RABBITMQ_QUEUE: test.events
     expose:
       - "8083"
@@ -33,24 +33,24 @@ services:
       start_period: 10s
     labels:
       - traefik.enable=true
-      - traefik.docker.network=demo-observability-net
+      - traefik.docker.network=app-observability-net
       # Router 1: Rutas publicas (sin JWT, priority 100)
-      - 'traefik.http.routers.demo-test-fastapi-public.rule=PathPrefix(`/api/test/public`) || PathPrefix(`/api/test/docs`) || PathPrefix(`/api/test/openapi.json`)'
-      - traefik.http.routers.demo-test-fastapi-public.entrypoints=web
-      - traefik.http.routers.demo-test-fastapi-public.middlewares=demo-ratelimit@docker,demo-secure-headers@docker
-      - traefik.http.routers.demo-test-fastapi-public.service=demo-test-fastapi
-      - traefik.http.routers.demo-test-fastapi-public.priority=100
+      - 'traefik.http.routers.app-test-fastapi-public.rule=PathPrefix(`/api/test/public`) || PathPrefix(`/api/test/docs`) || PathPrefix(`/api/test/openapi.json`)'
+      - traefik.http.routers.app-test-fastapi-public.entrypoints=web
+      - traefik.http.routers.app-test-fastapi-public.middlewares=app-ratelimit@docker,app-secure-headers@docker
+      - traefik.http.routers.app-test-fastapi-public.service=app-test-fastapi
+      - traefik.http.routers.app-test-fastapi-public.priority=100
       # Router 2: Rutas protegidas (exigen JWT, priority 10)
-      - 'traefik.http.routers.demo-test-fastapi.rule=PathPrefix(`/api/test`)'
-      - traefik.http.routers.demo-test-fastapi.entrypoints=web
-      - traefik.http.routers.demo-test-fastapi.middlewares=demo-jwt-auth@file,demo-ratelimit@docker,demo-inflight@docker,demo-secure-headers@docker
-      - traefik.http.routers.demo-test-fastapi.service=demo-test-fastapi
-      - traefik.http.routers.demo-test-fastapi.priority=10
+      - 'traefik.http.routers.app-test-fastapi.rule=PathPrefix(`/api/test`)'
+      - traefik.http.routers.app-test-fastapi.entrypoints=web
+      - traefik.http.routers.app-test-fastapi.middlewares=app-jwt-auth@file,app-ratelimit@docker,app-inflight@docker,app-secure-headers@docker
+      - traefik.http.routers.app-test-fastapi.service=app-test-fastapi
+      - traefik.http.routers.app-test-fastapi.priority=10
       # Loadbalancer
-      - traefik.http.services.demo-test-fastapi.loadbalancer.server.port=8083
+      - traefik.http.services.app-test-fastapi.loadbalancer.server.port=8083
     networks:
-      - demo-net
+      - app-net
 
 networks:
-  demo-net:
-    name: demo-observability-net
+  app-net:
+    name: app-observability-net

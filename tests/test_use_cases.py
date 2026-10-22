@@ -88,7 +88,7 @@ class UseCaseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.item = Item(
             id=1,
-            name="demo",
+            name="app",
             created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
 
@@ -118,36 +118,36 @@ class UseCaseTests(unittest.IsolatedAsyncioTestCase):
         repository = FakeRepository([self.item])
         cache = FakeCache()
 
-        result = await CreateItem(repository, cache).execute("demo")
+        result = await CreateItem(repository, cache).execute("app")
 
         self.assertEqual(result, self.item)
-        self.assertEqual(repository.created_names, ["demo"])
+        self.assertEqual(repository.created_names, ["app"])
         self.assertTrue(cache.invalidated)
 
     async def test_publish_event_stores_and_publishes(self):
         publisher = FakePublisher()
         repository = FakeEventsRepository()
 
-        event_id = await PublishEvent(publisher, repository).execute("demo")
+        event_id = await PublishEvent(publisher, repository).execute("app")
 
         self.assertEqual(len(publisher.events), 1)
         self.assertEqual(publisher.events[0].event_id, event_id)
-        self.assertEqual(publisher.events[0].name, "demo")
+        self.assertEqual(publisher.events[0].name, "app")
         self.assertIn(event_id, repository.events)
 
     async def test_publish_event_removes_record_when_broker_fails(self):
         repository = FakeEventsRepository()
 
         with self.assertRaises(RuntimeError):
-            await PublishEvent(FailingPublisher(), repository).execute("demo")
+            await PublishEvent(FailingPublisher(), repository).execute("app")
 
         self.assertEqual(repository.events, {})
 
     async def test_event_crud_use_cases(self):
         repository = FakeEventsRepository()
-        event_id = await PublishEvent(FakePublisher(), repository).execute("demo")
+        event_id = await PublishEvent(FakePublisher(), repository).execute("app")
 
-        self.assertEqual((await GetEvent(repository).execute(event_id)).name, "demo")
+        self.assertEqual((await GetEvent(repository).execute(event_id)).name, "app")
         self.assertEqual(len(await ListEvents(repository).execute()), 1)
 
         updated = await UpdateEvent(repository).execute(event_id, "renamed")

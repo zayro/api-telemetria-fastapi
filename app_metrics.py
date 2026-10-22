@@ -3,13 +3,13 @@ from time import perf_counter
 from prometheus_client import Counter, Histogram
 
 REQUESTS = Counter(
-    "demo_http_requests_total",
-    "Total de solicitudes HTTP del demo",
+    "app_http_requests_total",
+    "Total de solicitudes HTTP del app",
     ["service", "route", "status"],
 )
 DURATION = Histogram(
-    "demo_http_request_duration_seconds",
-    "Duracion de solicitudes HTTP del demo",
+    "app_http_request_duration_seconds",
+    "Duracion de solicitudes HTTP del app",
     ["service", "route"],
 )
 

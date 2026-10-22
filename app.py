@@ -35,9 +35,9 @@ from telemetry import setup_telemetry, structured_log
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "test-fastapi-service")
 PORT = int(os.getenv("SERVICE_PORT", "8083"))
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://demo:demo@postgres:5432/demo")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://app:app@postgres:5432/app")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://demo:demo@rabbitmq:5672/")
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://app:app@rabbitmq:5672/")
 RABBITMQ_QUEUE = os.getenv("RABBITMQ_QUEUE", "test.events")
 
 
