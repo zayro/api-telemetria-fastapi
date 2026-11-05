@@ -14,6 +14,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-app}@rabbitmq:5672/
       RABBITMQ_QUEUE: test.events
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      PROTOCOLS_DIR: ${PROTOCOLS_DIR:-data/protocols}
     expose:
       - "8083"
     depends_on:

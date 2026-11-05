@@ -9,4 +9,5 @@ COPY api/ api/
 COPY application/ application/
 COPY domain/ domain/
 COPY infrastructure/ infrastructure/
+COPY data/ data/
 CMD ["python", "app.py"]
