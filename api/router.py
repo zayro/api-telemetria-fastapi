@@ -6,9 +6,17 @@ from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse
 from opentelemetry import trace
 
-from api.schemas import EventIn, EventUpdate, ItemIn
+from api.schemas import (
+    EventIn,
+    EventUpdate,
+    ItemIn,
+    ProtocolDocumentOut,
+    ProtocolRAGIn,
+    ProtocolRAGOut,
+    ProtocolSourceOut,
+)
 from app_metrics import record_request
-from domain.errors import EventNotFound
+from domain.errors import EventNotFound, GeminiServiceError, ProtocolNotFound
 from domain.models import Event
 from telemetry import structured_log
 
@@ -294,3 +302,139 @@ async def list_items(request: Request):
         raise
     finally:
         record_request(request.app.title, "/api/test/items", status, started)
+
+
+@router.post(
+    "/api/test/protocols/rag",
+    response_model=ProtocolRAGOut,
+    summary="Buscar en corpus de protocolos y generar respuesta con RAG + Gemini LLM",
+)
+async def query_protocols_rag(body: ProtocolRAGIn, request: Request):
+    started = time.perf_counter()
+    status = 200
+    auth = get_auth_context(request)
+    try:
+        rag_answer = await request.app.state.container.query_protocols_rag.execute(
+            query=body.query,
+            top_k=body.top_k,
+            category=body.category,
+            generate_answer=body.generate_answer,
+            temperature=body.temperature,
+        )
+        structured_log(
+            request.app.state.logger,
+            "protocols_rag_executed",
+            query=body.query,
+            category=body.category,
+            sources_count=len(rag_answer.sources),
+            generate_answer=body.generate_answer,
+            model=rag_answer.model,
+            user=auth["user"],
+        )
+        return {
+            "ok": True,
+            "query": rag_answer.query,
+            "answer": rag_answer.answer,
+            "model": rag_answer.model,
+            "total_sources": len(rag_answer.sources),
+            "sources": [
+                {
+                    "protocol_id": s.document.id,
+                    "title": s.document.title,
+                    "content": s.document.content,
+                    "source_file": s.document.source_file,
+                    "category": s.document.category,
+                    "score": s.score,
+                    "metadata": s.document.metadata,
+                }
+                for s in rag_answer.sources
+            ],
+        }
+    except GeminiServiceError as exc:
+        status = 502
+        structured_log(
+            request.app.state.logger,
+            "protocols_rag_gemini_error",
+            query=body.query,
+            error=str(exc),
+            user=auth["user"],
+        )
+        return JSONResponse(
+            status_code=502,
+            content={
+                "ok": False,
+                "error": f"Error del servicio Gemini: {exc.message}",
+                "query": body.query,
+            },
+        )
+    except Exception:
+        status = 500
+        raise
+    finally:
+        record_request(request.app.title, "/api/test/protocols/rag", status, started)
+
+
+@router.get(
+    "/api/test/protocols",
+    summary="Listar protocolos disponibles en el corpus RAG",
+)
+async def list_protocols(request: Request):
+    started = time.perf_counter()
+    status = 200
+    try:
+        documents = await request.app.state.container.list_protocols.execute()
+        return {
+            "ok": True,
+            "total": len(documents),
+            "protocols": [
+                {
+                    "id": doc.id,
+                    "title": doc.title,
+                    "source_file": doc.source_file,
+                    "category": doc.category,
+                    "metadata": doc.metadata,
+                }
+                for doc in documents
+            ],
+        }
+    except Exception:
+        status = 500
+        raise
+    finally:
+        record_request(request.app.title, "/api/test/protocols", status, started)
+
+
+@router.get(
+    "/api/test/protocols/{protocol_id}",
+    summary="Consultar un protocolo específico del corpus por su ID",
+)
+async def get_protocol(protocol_id: str, request: Request):
+    started = time.perf_counter()
+    status = 200
+    try:
+        doc = await request.app.state.container.get_protocol.execute(protocol_id)
+        return {
+            "ok": True,
+            "protocol": {
+                "id": doc.id,
+                "title": doc.title,
+                "content": doc.content,
+                "source_file": doc.source_file,
+                "category": doc.category,
+                "metadata": doc.metadata,
+            },
+        }
+    except ProtocolNotFound:
+        status = 404
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "error": f"Protocolo '{protocol_id}' no encontrado en el corpus."},
+        )
+    except Exception:
+        status = 500
+        raise
+    finally:
+        record_request(
+            request.app.title, f"/api/test/protocols/{protocol_id}", status, started
+        )
+

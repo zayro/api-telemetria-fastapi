@@ -19,13 +19,18 @@ from application.use_cases import (
     CreateItem,
     DeleteEvent,
     GetEvent,
+    GetProtocol,
     ListEvents,
     ListItems,
+    ListProtocols,
     PublishEvent,
+    QueryProtocolsRAG,
     SimulateTest,
     UpdateEvent,
 )
 from infrastructure.adapters import (
+    CorpusProtocolRetriever,
+    GeminiLLMAdapter,
     PostgresEventsRepository,
     PostgresItemsRepository,
     RabbitMQEventPublisher,
@@ -39,6 +44,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://app:app@postgres:5432/app
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://app:app@rabbitmq:5672/")
 RABBITMQ_QUEUE = os.getenv("RABBITMQ_QUEUE", "test.events")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+PROTOCOLS_DIR = os.getenv("PROTOCOLS_DIR", "data/protocols")
 
 
 @dataclass
@@ -51,6 +59,9 @@ class ServiceContainer:
     get_event: GetEvent
     update_event: UpdateEvent
     delete_event: DeleteEvent
+    query_protocols_rag: QueryProtocolsRAG
+    list_protocols: ListProtocols
+    get_protocol: GetProtocol
 
 async def connect_rabbitmq(url: str, logger: logging.Logger) -> aio_pika.RobustConnection:
     while True:
@@ -67,6 +78,9 @@ def create_app() -> FastAPI:
         "redis_url": REDIS_URL,
         "rabbitmq_url": RABBITMQ_URL,
         "rabbitmq_queue": RABBITMQ_QUEUE,
+        "gemini_api_key": GEMINI_API_KEY,
+        "gemini_model": GEMINI_MODEL,
+        "protocols_dir": PROTOCOLS_DIR,
     }
     tracer, logger = setup_telemetry(SERVICE_NAME)
 
@@ -109,6 +123,13 @@ def create_app() -> FastAPI:
                 settings["rabbitmq_queue"],
                 tracer,
             )
+            retriever = CorpusProtocolRetriever(settings["protocols_dir"], tracer)
+            gemini_client = GeminiLLMAdapter(
+                api_key=settings["gemini_api_key"],
+                model_name=settings["gemini_model"],
+                tracer=tracer,
+                logger=logger,
+            )
             app.state.container = ServiceContainer(
                 simulate_test=SimulateTest(),
                 create_item=CreateItem(repository, cache),
@@ -118,6 +139,9 @@ def create_app() -> FastAPI:
                 get_event=GetEvent(events_repository),
                 update_event=UpdateEvent(events_repository),
                 delete_event=DeleteEvent(events_repository),
+                query_protocols_rag=QueryProtocolsRAG(retriever, gemini_client),
+                list_protocols=ListProtocols(retriever),
+                get_protocol=GetProtocol(retriever),
             )
             app.state.pool = pool
             app.state.redis = redis_client
