@@ -1,6 +1,11 @@
 from typing import Protocol
 
-from domain.models import Event, Item
+from domain.models import (
+    Event,
+    Item,
+    ProtocolDocument,
+    ProtocolSearchResult,
+)
 
 
 class ItemsRepository(Protocol):
@@ -31,3 +36,23 @@ class EventsRepository(Protocol):
 
 class EventPublisher(Protocol):
     async def publish(self, event: Event) -> None: ...
+
+
+class ProtocolRetriever(Protocol):
+    async def search(
+        self, query: str, limit: int = 5, category: str | None = None
+    ) -> list[ProtocolSearchResult]: ...
+
+    async def list_documents(self) -> list[ProtocolDocument]: ...
+
+    async def get_document(self, document_id: str) -> ProtocolDocument | None: ...
+
+
+class LLMService(Protocol):
+    @property
+    def model_name(self) -> str: ...
+
+    async def generate_response(
+        self, prompt: str, context: list[str], temperature: float = 0.2
+    ) -> str: ...
+

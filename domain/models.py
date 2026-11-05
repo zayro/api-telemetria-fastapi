@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 
@@ -15,3 +15,28 @@ class Event:
     name: str
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ProtocolDocument:
+    id: str
+    title: str
+    content: str
+    source_file: str
+    category: str = "general"
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ProtocolSearchResult:
+    document: ProtocolDocument
+    score: float
+
+
+@dataclass(frozen=True)
+class RAGAnswer:
+    query: str
+    answer: str | None
+    model: str | None
+    sources: list[ProtocolSearchResult]
+
