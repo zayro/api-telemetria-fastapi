@@ -1,14 +1,16 @@
 import json
+import logging
 import time
 from uuid import UUID
 
-from fastapi import APIRouter, Query, Request, Response
+from fastapi import APIRouter, File, Form, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 from opentelemetry import trace
 
 from api.schemas import (
     EventIn,
     EventUpdate,
+    IngestResponse,
     ItemIn,
     ProtocolDocumentOut,
     ProtocolRAGIn,
@@ -16,7 +18,15 @@ from api.schemas import (
     ProtocolSourceOut,
 )
 from app_metrics import record_request
-from domain.errors import EventNotFound, GeminiServiceError, ProtocolNotFound
+from domain.errors import (
+    DocumentExtractionError,
+    EmbeddingServiceError,
+    EventNotFound,
+    FileTooLargeError,
+    GeminiServiceError,
+    ProtocolNotFound,
+    UnsupportedFileTypeError,
+)
 from domain.models import Event
 from telemetry import structured_log
 
@@ -344,6 +354,7 @@ async def query_protocols_rag(body: ProtocolRAGIn, request: Request):
                     "content": s.document.content,
                     "source_file": s.document.source_file,
                     "category": s.document.category,
+                    "doc_type": s.document.doc_type,
                     "score": s.score,
                     "metadata": s.document.metadata,
                 }
@@ -374,6 +385,121 @@ async def query_protocols_rag(body: ProtocolRAGIn, request: Request):
         record_request(request.app.title, "/api/test/protocols/rag", status, started)
 
 
+@router.post(
+    "/api/test/protocols/upload",
+    response_model=IngestResponse,
+    summary="Subir y vectorizar archivos de protocolos (PDF, imágenes, markdown, texto)",
+)
+async def upload_protocol_file(
+    request: Request,
+    file: UploadFile = File(...),
+    category: str = Form("general"),
+):
+    started = time.perf_counter()
+    status = 200
+    auth = get_auth_context(request)
+    ingest_use_case = request.app.state.container.ingest_protocol_file
+    max_bytes = getattr(ingest_use_case, "max_file_bytes", 20 * 1024 * 1024)
+    try:
+        content_bytes = await file.read(max_bytes + 1)
+        if len(content_bytes) > max_bytes:
+            raise FileTooLargeError(
+                f"El archivo supera el límite de {max_bytes // (1024 * 1024)} MB."
+            )
+
+        result = await ingest_use_case.execute(
+            filename=file.filename or "archivo_subido",
+            content=content_bytes,
+            category=category,
+            mime_type=file.content_type,
+        )
+        structured_log(
+            request.app.state.logger,
+            "protocol_file_ingested",
+            filename=result.source_file,
+            doc_type=result.doc_type,
+            chunks=result.chunks_count,
+            user=auth["user"],
+        )
+        return {
+            "ok": True,
+            "source_file": result.source_file,
+            "doc_type": result.doc_type,
+            "chunks_count": result.chunks_count,
+            "protocol_ids": result.protocol_ids,
+        }
+    except FileTooLargeError as exc:
+        status = 413
+        structured_log(
+            request.app.state.logger,
+            "protocol_file_too_large",
+            level=logging.WARNING,
+            filename=file.filename,
+            user=auth["user"],
+            error=exc.message,
+        )
+        return JSONResponse(
+            status_code=status, content={"ok": False, "error": exc.message}
+        )
+    except UnsupportedFileTypeError as exc:
+        status = 415
+        structured_log(
+            request.app.state.logger,
+            "protocol_file_unsupported",
+            level=logging.WARNING,
+            filename=file.filename,
+            user=auth["user"],
+            error=exc.message,
+        )
+        return JSONResponse(
+            status_code=status, content={"ok": False, "error": exc.message}
+        )
+    except DocumentExtractionError as exc:
+        status = 422
+        structured_log(
+            request.app.state.logger,
+            "protocol_file_extraction_failed",
+            level=logging.WARNING,
+            filename=file.filename,
+            user=auth["user"],
+            error=exc.message,
+        )
+        return JSONResponse(
+            status_code=status, content={"ok": False, "error": exc.message}
+        )
+    except (EmbeddingServiceError, GeminiServiceError) as exc:
+        status = 502
+        structured_log(
+            request.app.state.logger,
+            "protocol_file_embedding_failed",
+            level=logging.ERROR,
+            filename=file.filename,
+            user=auth["user"],
+            error=exc.message,
+        )
+        return JSONResponse(
+            status_code=status, content={"ok": False, "error": exc.message}
+        )
+    except Exception as exc:
+        status = 500
+        structured_log(
+            request.app.state.logger,
+            "protocol_file_ingest_failed",
+            level=logging.ERROR,
+            filename=file.filename,
+            user=auth["user"],
+            error=str(exc),
+        )
+        return JSONResponse(
+            status_code=status,
+            content={"ok": False, "error": "No se pudo procesar el archivo."},
+        )
+    finally:
+        record_request(
+            request.app.title, "/api/test/protocols/upload", status, started
+        )
+
+
 @router.get(
     "/api/test/protocols",
     summary="Listar protocolos disponibles en el corpus RAG",
@@ -392,6 +518,7 @@ async def list_protocols(request: Request):
                     "title": doc.title,
                     "source_file": doc.source_file,
                     "category": doc.category,
+                    "doc_type": doc.doc_type,
                     "metadata": doc.metadata,
                 }
                 for doc in documents
@@ -421,6 +548,7 @@ async def get_protocol(protocol_id: str, request: Request):
                 "content": doc.content,
                 "source_file": doc.source_file,
                 "category": doc.category,
+                "doc_type": doc.doc_type,
                 "metadata": doc.metadata,
             },
         }
@@ -437,4 +565,3 @@ async def get_protocol(protocol_id: str, request: Request):
         record_request(
             request.app.title, f"/api/test/protocols/{protocol_id}", status, started
         )
-

@@ -49,6 +49,7 @@ class ProtocolDocumentOut(BaseModel):
     content: str
     source_file: str
     category: str
+    doc_type: str = "text"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -58,6 +59,7 @@ class ProtocolSourceOut(BaseModel):
     content: str
     source_file: str
     category: str
+    doc_type: str = "text"
     score: float
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -70,3 +72,10 @@ class ProtocolRAGOut(BaseModel):
     total_sources: int
     sources: list[ProtocolSourceOut]
 
+
+class IngestResponse(BaseModel):
+    ok: bool = True
+    source_file: str
+    doc_type: str
+    chunks_count: int
+    protocol_ids: list[str]
