@@ -1,8 +1,12 @@
 import asyncio
+import hashlib
+import re
 import uuid
 from dataclasses import dataclass
 
 from application.ports import (
+    DocumentExtractor,
+    EmbeddingService,
     EventPublisher,
     EventsRepository,
     ItemsCache,
@@ -10,8 +14,14 @@ from application.ports import (
     LLMService,
     ProtocolRetriever,
 )
-from domain.errors import EventNotFound, ProtocolNotFound
-from domain.models import Event, Item, ProtocolDocument, RAGAnswer
+from domain.errors import (
+    DocumentExtractionError,
+    EmbeddingServiceError,
+    EventNotFound,
+    FileTooLargeError,
+    ProtocolNotFound,
+)
+from domain.models import Event, IngestResult, Item, ProtocolDocument, RAGAnswer
 
 CACHE_TTL_SECONDS = 30
 ITEMS_LIMIT = 20
@@ -139,7 +149,8 @@ class QueryProtocolsRAG:
         for i, res in enumerate(sources, start=1):
             doc = res.document
             context_blocks.append(
-                f"[{i}] Título: {doc.title} | Archivo: {doc.source_file} | Categoría: {doc.category}\n"
+                f"[{i}] Título: {doc.title} | Archivo: {doc.source_file} | "
+                f"Categoría: {doc.category} | Tipo: {doc.doc_type}\n"
                 f"Relevancia: {res.score:.2f}\n"
                 f"Contenido:\n{doc.content}"
             )
@@ -188,3 +199,158 @@ class GetProtocol:
             raise ProtocolNotFound(protocol_id)
         return doc
 
+
+def _chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> list[str]:
+    """Divide texto en fragmentos con solape, respetando párrafos y frases cuando es posible."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size debe ser mayor que cero")
+    overlap = max(0, min(overlap, chunk_size - 1))
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
+
+    chunks: list[str] = []
+    start = 0
+    length = len(normalized)
+    min_boundary = max(1, chunk_size // 2)
+
+    while start < length:
+        end = min(length, start + chunk_size)
+        if end < length:
+            # Preferir cortar en un salto de párrafo y, si no hay, en una frase.
+            boundary = normalized.rfind("\n\n", start + min_boundary, end)
+            if boundary != -1:
+                end = boundary
+            else:
+                sentence = normalized.rfind(". ", start + min_boundary, end)
+                if sentence != -1:
+                    end = sentence + 1
+
+        chunk = normalized[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        if end >= length:
+            break
+        start = max(end - overlap, start + 1)
+
+    return chunks
+
+
+class IngestProtocolFile:
+    def __init__(
+        self,
+        extractor: DocumentExtractor,
+        embedding_service: EmbeddingService,
+        retriever: ProtocolRetriever,
+        max_file_bytes: int = 20 * 1024 * 1024,
+        chunk_size: int = 800,
+        overlap: int = 100,
+    ):
+        self._extractor = extractor
+        self._embedding_service = embedding_service
+        self._retriever = retriever
+        self._max_file_bytes = max_file_bytes
+        self._chunk_size = chunk_size
+        self._overlap = overlap
+
+    @property
+    def max_file_bytes(self) -> int:
+        return self._max_file_bytes
+
+    async def execute(
+        self,
+        filename: str,
+        content: bytes,
+        category: str = "general",
+        mime_type: str | None = None,
+    ) -> IngestResult:
+        filename = (filename or "").strip()
+        if not filename:
+            raise DocumentExtractionError("El nombre del archivo es obligatorio.")
+        if not content:
+            raise DocumentExtractionError(f"El archivo '{filename}' está vacío.")
+        if len(content) > self._max_file_bytes:
+            raise FileTooLargeError(
+                f"El archivo '{filename}' supera el límite de "
+                f"{self._max_file_bytes // (1024 * 1024)} MB."
+            )
+
+        title, text_content, doc_type, metadata = await self._extractor.extract_content(
+            filename, content, mime_type
+        )
+        if not text_content or not text_content.strip():
+            raise DocumentExtractionError(
+                f"No se pudo extraer contenido indexable de '{filename}'."
+            )
+
+        chunks = _chunk_text(
+            text_content, chunk_size=self._chunk_size, overlap=self._overlap
+        )
+        if not chunks:
+            raise DocumentExtractionError(
+                f"No se generaron fragmentos indexables para '{filename}'."
+            )
+
+        embeddings = await self._embedding_service.embed_batch(
+            chunks, task_type="RETRIEVAL_DOCUMENT"
+        )
+        if len(embeddings) != len(chunks):
+            raise EmbeddingServiceError(
+                "El servicio de embeddings devolvió una cantidad de vectores "
+                "distinta a la cantidad de fragmentos."
+            )
+
+        dimensions = {len(embedding) for embedding in embeddings}
+        expected_dimension = getattr(self._embedding_service, "dimension", None)
+        if len(dimensions) != 1 or (expected_dimension and dimensions != {expected_dimension}):
+            raise EmbeddingServiceError(
+                "Los embeddings generados tienen dimensiones inconsistentes: "
+                f"{sorted(dimensions)} (esperado: {expected_dimension})."
+            )
+
+        content_hash = hashlib.sha256(content).hexdigest()
+        base_name = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        safe_stem = (
+            re.sub(r"[^a-z0-9]+", "-", base_name.lower()).strip("-") or "archivo"
+        )
+        embedding_model = getattr(self._embedding_service, "model_name", None)
+        embedding_dim = len(embeddings[0]) if embeddings else None
+        category = (category or "general").strip().lower() or "general"
+
+        documents: list[ProtocolDocument] = []
+        for idx, (chunk, embedding) in enumerate(
+            zip(chunks, embeddings), start=1
+        ):
+            chunk_id = f"file-{safe_stem}-{content_hash[:8]}-{idx}"
+            chunk_title = f"{title} (Parte {idx})" if len(chunks) > 1 else title
+            chunk_meta = {
+                **metadata,
+                "origin": "upload",
+                "content_hash": content_hash,
+                "chunk_index": idx,
+                "total_chunks": len(chunks),
+                "embedding_model": embedding_model,
+                "embedding_dim": embedding_dim,
+            }
+            documents.append(
+                ProtocolDocument(
+                    id=chunk_id,
+                    title=chunk_title,
+                    content=chunk,
+                    source_file=filename,
+                    category=category,
+                    doc_type=doc_type,
+                    metadata=chunk_meta,
+                    embedding=tuple(embedding),
+                )
+            )
+
+        await self._retriever.index_documents(documents, replace_source=filename)
+
+        return IngestResult(
+            source_file=filename,
+            doc_type=doc_type,
+            chunks_count=len(chunks),
+            protocol_ids=[doc.id for doc in documents],
+        )
