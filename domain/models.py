@@ -24,7 +24,9 @@ class ProtocolDocument:
     content: str
     source_file: str
     category: str = "general"
+    doc_type: str = "text"
     metadata: dict = field(default_factory=dict)
+    embedding: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -39,4 +41,12 @@ class RAGAnswer:
     answer: str | None
     model: str | None
     sources: list[ProtocolSearchResult]
+
+
+@dataclass(frozen=True)
+class IngestResult:
+    source_file: str
+    doc_type: str
+    chunks_count: int
+    protocol_ids: list[str]
 

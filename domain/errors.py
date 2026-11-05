@@ -16,3 +16,26 @@ class GeminiServiceError(Exception):
         self.message = message
         self.status_code = status_code
 
+
+class DocumentExtractionError(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+class EmbeddingServiceError(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+class FileTooLargeError(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+class UnsupportedFileTypeError(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
