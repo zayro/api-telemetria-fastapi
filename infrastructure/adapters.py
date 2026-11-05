@@ -861,74 +861,494 @@ class GeminiEmbeddingAdapter:
         return self._normalize(vec)
 
 
+class PostgresProtocolIndexRepository:
+    """Persiste el índice RAG en PostgreSQL con embeddings JSONB.
+
+    No requiere la extensión pgvector; la búsqueda se hace en memoria. Cuando
+    el corpus crezca conviene migrar la columna ``embedding`` a ``vector`` y
+    usar un índice ANN.
+    """
+
+    _COLUMNS = (
+        "id, title, content, source_file, category, doc_type, metadata, embedding"
+    )
+
+    def __init__(
+        self,
+        pool: AsyncConnectionPool,
+        tracer: trace.Tracer | None = None,
+        logger: logging.Logger | None = None,
+    ):
+        self._pool = pool
+        self._tracer = tracer
+        self._logger = logger
+
+    async def ensure_schema(self) -> None:
+        async with self._pool.connection() as conn:
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS protocol_chunks ("
+                "id TEXT PRIMARY KEY, "
+                "title TEXT NOT NULL, "
+                "content TEXT NOT NULL, "
+                "source_file TEXT NOT NULL, "
+                "category TEXT NOT NULL DEFAULT 'general', "
+                "doc_type TEXT NOT NULL DEFAULT 'text', "
+                "metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
+                "embedding JSONB, "
+                "updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS protocol_chunks_source_idx "
+                "ON protocol_chunks (source_file)"
+            )
+
+    async def load_all(self) -> list[ProtocolDocument]:
+        span_ctx = (
+            self._tracer.start_as_current_span("test.protocol_index_load")
+            if self._tracer
+            else nullcontext()
+        )
+        with span_ctx as span:
+            if span and hasattr(span, "set_attribute"):
+                span.set_attribute("db.system", "postgresql")
+                span.set_attribute("db.operation", "SELECT")
+                span.set_attribute("db.sql.table", "protocol_chunks")
+            async with self._pool.connection() as conn:
+                cursor = await conn.execute(
+                    f"SELECT {self._COLUMNS} FROM protocol_chunks ORDER BY id"
+                )
+                rows = await cursor.fetchall()
+
+        documents = []
+        for row in rows:
+            embedding = row[7]
+            documents.append(
+                ProtocolDocument(
+                    id=row[0],
+                    title=row[1],
+                    content=row[2],
+                    source_file=row[3],
+                    category=row[4],
+                    doc_type=row[5],
+                    metadata=row[6] or {},
+                    embedding=tuple(embedding) if embedding else None,
+                )
+            )
+        return documents
+
+    async def save_documents(self, documents: list[ProtocolDocument]) -> None:
+        if not documents:
+            return
+        async with self._pool.connection() as conn:
+            await self._insert(conn, documents)
+
+    async def replace_documents(
+        self, source_file: str, documents: list[ProtocolDocument]
+    ) -> None:
+        async with self._pool.connection() as conn:
+            await conn.execute(
+                "DELETE FROM protocol_chunks WHERE source_file = %s",
+                (source_file,),
+            )
+            await self._insert(conn, documents)
+
+    async def _insert(self, conn, documents: list[ProtocolDocument]) -> None:
+        rows = [
+            (
+                document.id,
+                document.title,
+                document.content,
+                document.source_file,
+                document.category,
+                document.doc_type,
+                self._jsonb(document.metadata),
+                self._jsonb(list(document.embedding)) if document.embedding else None,
+            )
+            for document in documents
+        ]
+        async with conn.cursor() as cursor:
+            await cursor.executemany(
+                "INSERT INTO protocol_chunks "
+                f"({self._COLUMNS}) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (id) DO UPDATE SET "
+                "title = EXCLUDED.title, "
+                "content = EXCLUDED.content, "
+                "source_file = EXCLUDED.source_file, "
+                "category = EXCLUDED.category, "
+                "doc_type = EXCLUDED.doc_type, "
+                "metadata = EXCLUDED.metadata, "
+                "embedding = EXCLUDED.embedding, "
+                "updated_at = now()",
+                rows,
+            )
+
+    @staticmethod
+    def _jsonb(value):
+        from psycopg.types.json import Jsonb
+
+        return Jsonb(value)
+
+
 class CorpusProtocolRetriever:
-    """Recuperador RAG sobre un corpus de protocolos (archivos locales y documentos en memoria)."""
+    """Recuperador RAG híbrido (coseno + BM25) con carga async y persistencia opcional."""
+
+    _SUPPORTED_SUFFIXES = {f".{ext}" for ext in _SUPPORTED_EXTENSIONS}
 
     def __init__(
         self,
         protocols_dir: str | Path | None = None,
         tracer: trace.Tracer | None = None,
+        embedding_service=None,
+        extractor: MultimodalDocumentExtractor | None = None,
+        index_repository=None,
+        logger: logging.Logger | None = None,
     ):
         self._protocols_dir = Path(protocols_dir) if protocols_dir else None
         self._tracer = tracer
+        self._embedding_service = embedding_service
+        self._extractor = extractor or MultimodalDocumentExtractor(logger=logger)
+        self._index_repository = index_repository
+        self._logger = logger
         self._documents: dict[str, ProtocolDocument] = {}
-        self._load_corpus()
+        self._initialized = False
+        self._init_lock = asyncio.Lock()
 
-    def _load_corpus(self) -> None:
-        # 1. Cargar protocolos predeterminados
-        for doc in _DEFAULT_PROTOCOLS:
-            self._documents[doc.id] = doc
+    async def initialize(self) -> None:
+        """Carga el corpus y los embeddings una sola vez, dentro del event loop."""
+        if self._initialized:
+            return
+        async with self._init_lock:
+            if self._initialized:
+                return
+            await self._initialize()
+            self._initialized = True
 
-        # 2. Cargar archivos del directorio configurado (si existe)
+    async def _initialize(self) -> None:
+        stored_documents: list[ProtocolDocument] = []
+        if self._index_repository:
+            try:
+                stored_documents = await self._index_repository.load_all()
+            except Exception as exc:
+                self._log("rag_index_load_failed", level=logging.ERROR, error=str(exc))
+
+        self._documents = {doc.id: doc for doc in stored_documents}
+        await self._sync_corpus_documents()
+        await self._ensure_embeddings()
+
+    async def _sync_corpus_documents(self) -> None:
+        documents_by_source: dict[str, list[ProtocolDocument]] = {}
+        for document in self._documents.values():
+            documents_by_source.setdefault(document.source_file, []).append(document)
+
+        local_sources: set[str] = set()
         if self._protocols_dir and self._protocols_dir.exists():
-            for file_path in self._protocols_dir.glob("**/*"):
-                if file_path.is_file() and file_path.suffix.lower() in {".md", ".txt", ".json"}:
-                    self._index_file(file_path)
+            try:
+                paths = sorted(
+                    path
+                    for path in self._protocols_dir.glob("**/*")
+                    if path.is_file()
+                    and path.suffix.lower() in self._SUPPORTED_SUFFIXES
+                )
+            except Exception as exc:
+                self._log(
+                    "rag_corpus_scan_failed", level=logging.ERROR, error=str(exc)
+                )
+                paths = []
 
-    def _index_file(self, file_path: Path) -> None:
-        try:
-            content = file_path.read_text(encoding="utf-8")
-        except Exception:
+            for path in paths:
+                local_sources.add(path.name)
+                try:
+                    await self._sync_local_file(
+                        path, documents_by_source.get(path.name, [])
+                    )
+                except Exception as exc:
+                    self._log(
+                        "rag_corpus_file_failed",
+                        level=logging.WARNING,
+                        file=path.name,
+                        error=str(exc),
+                    )
+
+        for default in _DEFAULT_PROTOCOLS:
+            if default.source_file in local_sources:
+                continue
+            try:
+                await self._sync_default_document(
+                    default, documents_by_source.get(default.source_file, [])
+                )
+            except Exception as exc:
+                self._log(
+                    "rag_default_document_failed",
+                    level=logging.WARNING,
+                    file=default.source_file,
+                    error=str(exc),
+                )
+
+    async def _sync_local_file(
+        self, path: Path, stored_documents: list[ProtocolDocument]
+    ) -> None:
+        raw_bytes = await asyncio.to_thread(path.read_bytes)
+        content_hash = hashlib.sha256(raw_bytes).hexdigest()
+
+        if any(
+            document.metadata.get("origin") == "upload"
+            for document in stored_documents
+        ):
+            # Un archivo subido por el usuario no se sobrescribe con el corpus.
             return
 
-        doc_id = f"file-{file_path.stem}"
-        title = file_path.stem.replace("_", " ").replace("-", " ").title()
-        category = "general"
+        if stored_documents and all(
+            document.metadata.get("content_hash") == content_hash
+            for document in stored_documents
+        ):
+            return
 
-        # Detección simple de categoría por carpeta o nombre
-        parent_name = file_path.parent.name.lower()
-        if parent_name in {"seguridad", "redes", "operaciones", "datos", "sistemas"}:
-            category = parent_name
-        elif "seguridad" in file_path.name.lower():
-            category = "seguridad"
-        elif "red" in file_path.name.lower() or "tls" in file_path.name.lower():
-            category = "redes"
-        elif "respaldo" in file_path.name.lower() or "cicd" in file_path.name.lower() or "ops" in file_path.name.lower():
-            category = "operaciones"
-
-        # Extraer primer título H1 en markdown si existe
-        first_h1 = re.search(r"^#\s+(.+)$", content, re.MULTILINE)
-        if first_h1:
-            title = first_h1.group(1).strip()
-
-        self._documents[doc_id] = ProtocolDocument(
-            id=doc_id,
+        title, content, doc_type, metadata = await self._extractor.extract_content(
+            path.name, raw_bytes
+        )
+        document = ProtocolDocument(
+            id=f"file-{path.stem}",
             title=title,
-            content=content.strip(),
-            source_file=file_path.name,
-            category=category,
-            metadata={"path": str(file_path)},
+            content=content,
+            source_file=path.name,
+            category=self._detect_category(path),
+            doc_type=doc_type,
+            metadata={
+                **metadata,
+                "path": str(path),
+                "origin": "corpus",
+                "content_hash": content_hash,
+            },
+        )
+        await self._store_documents(
+            [document], replace_source=path.name, require_embeddings=False
         )
 
+    async def _sync_default_document(
+        self, default: ProtocolDocument, stored_documents: list[ProtocolDocument]
+    ) -> None:
+        if any(
+            document.metadata.get("origin") == "upload"
+            for document in stored_documents
+        ):
+            return
+
+        content_hash = hashlib.sha256(default.content.encode("utf-8")).hexdigest()
+        if stored_documents and all(
+            document.metadata.get("content_hash") == content_hash
+            for document in stored_documents
+        ):
+            return
+
+        document = replace(
+            default,
+            embedding=None,
+            metadata={
+                **default.metadata,
+                "origin": "corpus",
+                "content_hash": content_hash,
+            },
+        )
+        await self._store_documents(
+            [document],
+            replace_source=default.source_file,
+            require_embeddings=False,
+        )
+
+    @staticmethod
+    def _detect_category(path: Path) -> str:
+        parent_name = path.parent.name.lower()
+        if parent_name in {"seguridad", "redes", "operaciones", "datos", "sistemas"}:
+            return parent_name
+        if "seguridad" in path.name.lower():
+            return "seguridad"
+        if "red" in path.name.lower() or "tls" in path.name.lower():
+            return "redes"
+        if (
+            "respaldo" in path.name.lower()
+            or "cicd" in path.name.lower()
+            or "ops" in path.name.lower()
+        ):
+            return "operaciones"
+        return "general"
+
+    async def _ensure_embeddings(self) -> None:
+        if not self._embedding_service:
+            return
+        expected_model = getattr(self._embedding_service, "model_name", None)
+        expected_dimension = getattr(self._embedding_service, "dimension", None)
+
+        stale = [
+            document
+            for document in self._documents.values()
+            if document.embedding is None
+            or (
+                expected_dimension is not None
+                and len(document.embedding) != expected_dimension
+            )
+            or (
+                expected_model is not None
+                and document.metadata.get("embedding_model") != expected_model
+            )
+        ]
+        if not stale:
+            return
+
+        updated = await self._with_embeddings(
+            [replace(document, embedding=None) for document in stale],
+            required=False,
+        )
+        refreshed = [document for document in updated if document.embedding]
+        for document in refreshed:
+            self._documents[document.id] = document
+        if refreshed:
+            await self._persist(refreshed, replace_source=None)
+
+    async def _with_embeddings(
+        self, documents: list[ProtocolDocument], required: bool
+    ) -> list[ProtocolDocument]:
+        if not documents:
+            return []
+        if not self._embedding_service:
+            return documents
+
+        pending = [document for document in documents if not document.embedding]
+        if not pending:
+            return documents
+
+        try:
+            vectors = await self._embedding_service.embed_batch(
+                [document.content for document in pending],
+                task_type="RETRIEVAL_DOCUMENT",
+            )
+        except Exception as exc:
+            self._log(
+                "rag_embedding_failed",
+                level=logging.ERROR,
+                error=str(exc),
+                documents=len(pending),
+            )
+            if required:
+                raise
+            return documents
+
+        if len(vectors) != len(pending):
+            message = (
+                "El servicio de embeddings devolvió una cantidad de vectores "
+                f"distinta a la esperada ({len(vectors)} != {len(pending)})."
+            )
+            if required:
+                raise EmbeddingServiceError(message)
+            self._log("rag_embedding_count_mismatch", level=logging.ERROR, error=message)
+            return documents
+
+        expected_dimension = getattr(self._embedding_service, "dimension", None)
+        if expected_dimension is not None and any(
+            len(vector) != expected_dimension for vector in vectors
+        ):
+            message = (
+                "Los embeddings tienen dimensiones inconsistentes; se esperaba "
+                f"{expected_dimension}."
+            )
+            if required:
+                raise EmbeddingServiceError(message)
+            self._log("rag_embedding_dimension_mismatch", level=logging.ERROR, error=message)
+            return documents
+
+        model_name = getattr(self._embedding_service, "model_name", None)
+        vectors_by_id = {
+            document.id: vector for document, vector in zip(pending, vectors)
+        }
+        enriched = []
+        for document in documents:
+            vector = document.embedding or vectors_by_id.get(document.id)
+            if not vector:
+                enriched.append(document)
+                continue
+            enriched.append(
+                replace(
+                    document,
+                    embedding=tuple(vector),
+                    metadata={
+                        **document.metadata,
+                        "embedding_model": model_name,
+                        "embedding_dim": len(vector),
+                    },
+                )
+            )
+        return enriched
+
+    async def _store_documents(
+        self,
+        documents: list[ProtocolDocument],
+        replace_source: str | None,
+        require_embeddings: bool = True,
+    ) -> None:
+        enriched = await self._with_embeddings(
+            documents, required=require_embeddings
+        )
+        await self._persist(enriched, replace_source=replace_source)
+
+        if replace_source:
+            self._documents = {
+                document_id: document
+                for document_id, document in self._documents.items()
+                if document.source_file != replace_source
+            }
+        for document in enriched:
+            self._documents[document.id] = document
+
+    async def _persist(
+        self, documents: list[ProtocolDocument], replace_source: str | None
+    ) -> None:
+        if not self._index_repository or not documents:
+            return
+        try:
+            if replace_source:
+                await self._index_repository.replace_documents(
+                    replace_source, documents
+                )
+            else:
+                await self._index_repository.save_documents(documents)
+        except Exception as exc:
+            self._log(
+                "rag_index_persist_failed",
+                level=logging.ERROR,
+                error=str(exc),
+                documents=len(documents),
+            )
+            raise
+
+    def _log(self, event: str, level: int = logging.INFO, **fields) -> None:
+        if self._logger:
+            structured_log(self._logger, event, level=level, **fields)
+
+    async def index_document(self, document: ProtocolDocument) -> None:
+        await self.index_documents([document], replace_source=None)
+
+    async def index_documents(
+        self,
+        documents: list[ProtocolDocument],
+        replace_source: str | None = None,
+    ) -> None:
+        await self.initialize()
+        if not documents:
+            return
+        await self._store_documents(documents, replace_source=replace_source)
+
     async def list_documents(self) -> list[ProtocolDocument]:
+        await self.initialize()
         return list(self._documents.values())
 
     async def get_document(self, document_id: str) -> ProtocolDocument | None:
+        await self.initialize()
         return self._documents.get(document_id)
 
     async def search(
         self, query: str, limit: int = 5, category: str | None = None
     ) -> list[ProtocolSearchResult]:
+        await self.initialize()
+
         span_ctx = (
             self._tracer.start_as_current_span("test.rag_search")
             if self._tracer
@@ -952,28 +1372,25 @@ class CorpusProtocolRetriever:
                 return []
 
             if not q_tokens:
-                # Si no hay tokens en la query, devolver los primeros limit
-                return [ProtocolSearchResult(document=d, score=1.0) for d in docs[:limit]]
+                return [
+                    ProtocolSearchResult(document=d, score=1.0)
+                    for d in docs[:limit]
+                ]
 
-            # Cálculo de BM25
+            # 1. Puntuación léxica BM25
             n_docs = len(docs)
             doc_tokens = {d.id: _tokenize(d.title + " " + d.content) for d in docs}
             avg_dl = sum(len(toks) for toks in doc_tokens.values()) / max(1, n_docs)
-
-            # Document frequency para cada término de la consulta
             df: dict[str, int] = {}
             for t in set(q_tokens):
                 df[t] = sum(1 for d in docs if t in doc_tokens[d.id])
 
-            k1 = 1.5
-            b = 0.75
-            scored: list[tuple[float, ProtocolDocument]] = []
-
+            k1, b = 1.5, 0.75
+            bm25_scores: dict[str, float] = {}
             for doc in docs:
                 tokens = doc_tokens[doc.id]
                 dl = len(tokens)
-                score = 0.0
-
+                b_score = 0.0
                 for t in q_tokens:
                     doc_freq = df.get(t, 0)
                     if doc_freq == 0:
@@ -982,42 +1399,99 @@ class CorpusProtocolRetriever:
                     tf = tokens.count(t)
                     if tf == 0:
                         continue
-
-                    # Ponderación BM25
-                    term_score = idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * (dl / avg_dl)))
-
-                    # Bonificación si el término aparece en el título
+                    term_score = (
+                        idf
+                        * (tf * (k1 + 1.0))
+                        / (tf + k1 * (1.0 - b + b * (dl / avg_dl)))
+                    )
                     if t in _tokenize(doc.title):
                         term_score *= 2.0
+                    b_score += term_score
 
-                    score += term_score
+                if clean_query and clean_query in " ".join(tokens):
+                    b_score += 2.5
+                bm25_scores[doc.id] = b_score
 
-                # Bonificación por coincidencia de frase exacta en el texto
-                doc_text_clean = " ".join(tokens)
-                if clean_query and clean_query in doc_text_clean:
-                    score += 2.5
+            max_bm25 = max(bm25_scores.values()) if bm25_scores else 1.0
 
-                if score > 0.0:
-                    scored.append((score, doc))
+            # 2. Puntuación vectorial (solo vectores del mismo modelo/dimensión)
+            query_embedding: list[float] | None = None
+            expected_model = getattr(self._embedding_service, "model_name", None)
+            if self._embedding_service:
+                try:
+                    query_embedding = await self._embedding_service.embed_text(
+                        query, task_type="RETRIEVAL_QUERY"
+                    )
+                except Exception as exc:
+                    self._log(
+                        "rag_query_embedding_failed",
+                        level=logging.WARNING,
+                        error=str(exc),
+                    )
 
-            if not scored:
-                # Fallback: si ningún término coincidió exactamente, devolver los más recientes con score mínimo
-                return [ProtocolSearchResult(document=d, score=0.1) for d in docs[:limit]]
+            final_scored: list[tuple[float, ProtocolDocument]] = []
+            for doc in docs:
+                b_norm = (
+                    (bm25_scores.get(doc.id, 0.0) / max_bm25)
+                    if max_bm25 > 0
+                    else 0.0
+                )
+                cosine_sim = 0.0
+                if (
+                    query_embedding
+                    and doc.embedding
+                    and len(query_embedding) == len(doc.embedding)
+                    and (
+                        expected_model is None
+                        or doc.metadata.get("embedding_model") == expected_model
+                    )
+                ):
+                    dot = sum(q * d for q, d in zip(query_embedding, doc.embedding))
+                    cosine_sim = max(0.0, dot)
 
-            # Ordenar por puntuación descendente
-            scored.sort(key=lambda x: x[0], reverse=True)
-            max_score = scored[0][0]
+                combined = (
+                    0.7 * cosine_sim + 0.3 * b_norm
+                    if query_embedding
+                    else b_norm
+                )
+                if combined > 0.0:
+                    final_scored.append((combined, doc))
 
-            results = []
-            for raw_score, doc in scored[:limit]:
-                # Normalizar a una escala entre 0.0 y 1.0
-                normalized = round(min(1.0, raw_score / max(1e-6, max_score)), 4)
-                results.append(ProtocolSearchResult(document=doc, score=normalized))
+            if not final_scored:
+                return [
+                    ProtocolSearchResult(document=d, score=0.1)
+                    for d in docs[:limit]
+                ]
+
+            final_scored.sort(key=lambda x: x[0], reverse=True)
+            max_combined = final_scored[0][0]
+
+            # Diversidad: evitar que un solo archivo ocupe todo el top_k.
+            results: list[ProtocolSearchResult] = []
+            per_source: dict[str, int] = {}
+            overflow: list[tuple[float, ProtocolDocument]] = []
+            for raw_score, doc in final_scored:
+                if per_source.get(doc.source_file, 0) >= 2:
+                    overflow.append((raw_score, doc))
+                    continue
+                norm = round(min(1.0, raw_score / max(1e-6, max_combined)), 4)
+                results.append(ProtocolSearchResult(document=doc, score=norm))
+                per_source[doc.source_file] = per_source.get(doc.source_file, 0) + 1
+                if len(results) >= limit:
+                    break
+
+            if len(results) < limit:
+                for raw_score, doc in overflow:
+                    norm = round(min(1.0, raw_score / max(1e-6, max_combined)), 4)
+                    results.append(ProtocolSearchResult(document=doc, score=norm))
+                    if len(results) >= limit:
+                        break
 
             if span and hasattr(span, "set_attribute"):
                 span.set_attribute("rag.results_count", len(results))
 
             return results
+
 
 
 class GeminiLLMAdapter:
