@@ -16,6 +16,9 @@ services:
       RABBITMQ_QUEUE: test.events
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      GEMINI_EMBEDDING_MODEL: ${GEMINI_EMBEDDING_MODEL:-gemini-embedding-001}
+      GEMINI_EMBEDDING_DIM: ${GEMINI_EMBEDDING_DIM:-768}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-20971520}
       PROTOCOLS_DIR: ${PROTOCOLS_DIR:-data/protocols}
     expose:
       - "8083"

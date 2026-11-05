@@ -57,6 +57,17 @@ Las rutas de negocio conservan sus contratos:
     }
     ```
   - Si `generate_answer: false`, realiza únicamente la recuperación semántica (RAG retrieval) sin invocar al LLM.
+- `POST /api/test/protocols/upload`: recibe un archivo multipart (`file`) y una
+  `category` opcional, extrae su contenido, lo divide en fragmentos, genera
+  embeddings y lo indexa en el RAG. Formatos soportados: `.md`, `.markdown`,
+  `.txt`, `.json`, `.csv`, `.html`, `.pdf`, `.png`, `.jpg`, `.jpeg`, `.webp`.
+  - Los PDF con capa de texto se procesan localmente con `pypdf`. Los PDF
+    escaneados y las imágenes requieren `GEMINI_API_KEY` para transcribir o
+    describir su contenido con visión multimodal.
+  - Re-subir un archivo reemplaza sus fragmentos anteriores.
+  - Ejemplo: `curl.exe -F "file=@manual.pdf" -F "category=seguridad" http://localhost:8000/api/test/protocols/upload`
+  - Respuestas de error: `413` archivo demasiado grande, `415` formato no
+    soportado, `422` sin contenido indexable, `502` fallo de Gemini.
 - `GET /api/test/protocols`: lista todos los protocolos indexados en el corpus RAG (archivos en `data/protocols` y protocolos predeterminados).
 - `GET /api/test/protocols/{protocol_id}`: consulta los detalles completos y contenido de un protocolo específico del corpus.
 - `GET /health/live`: comprueba que el proceso responde.
@@ -72,9 +83,19 @@ Fastify.
 
 El servicio acepta estas variables de entorno: `SERVICE_NAME`,
 `SERVICE_PORT`, `DATABASE_URL`, `REDIS_URL`, `RABBITMQ_URL`, `RABBITMQ_QUEUE`,
-`GEMINI_API_KEY`, `GEMINI_MODEL` (por defecto `gemini-2.5-flash`), `PROTOCOLS_DIR` (por defecto `data/protocols`),
+`GEMINI_API_KEY`, `GEMINI_MODEL` (por defecto `gemini-2.5-flash`),
+`GEMINI_EMBEDDING_MODEL` (por defecto `gemini-embedding-001`),
+`GEMINI_EMBEDDING_DIM` (por defecto `768`), `MAX_UPLOAD_BYTES` (por defecto
+20 MB), `PROTOCOLS_DIR` (por defecto `data/protocols`),
 `OTEL_EXPORTER_OTLP_ENDPOINT` y `DEPLOYMENT_ENVIRONMENT`. En Compose, los
 valores de conexion apuntan a los nombres de servicio de la red Docker.
+
+El índice vectorial se persiste en la tabla `protocol_chunks` de PostgreSQL
+(embeddings en JSONB, sin requerir la extensión pgvector). Al arrancar se
+recupera el índice existente y se agregan o actualizan los archivos del corpus
+que hayan cambiado. Si no hay `GEMINI_API_KEY`, se usa un embedding local
+determinista de 128 dimensiones para desarrollo; al configurar la clave, los
+documentos se re-vectorizan automáticamente con Gemini.
 
 ## Pruebas
 
