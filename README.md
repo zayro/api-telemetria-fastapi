@@ -45,6 +45,20 @@ Las rutas de negocio conservan sus contratos:
   y `updated_at`. No vuelve a publicar el mensaje.
 - `DELETE /api/test/events/{event_id}`: elimina el registro y responde `204`.
   Los mensajes ya publicados en RabbitMQ no se retiran.
+- `POST /api/test/protocols/rag`: consulta RAG sobre el corpus de protocolos con integración al LLM de Google Gemini. Permite buscar fragmentos relevantes en los archivos de protocolos y generar una respuesta contextualizada y fundamentada.
+  - Body de ejemplo:
+    ```json
+    {
+      "query": "¿Cuáles son los pasos obligatorios ante una fuga de datos según el protocolo?",
+      "top_k": 3,
+      "category": "seguridad",
+      "generate_answer": true,
+      "temperature": 0.2
+    }
+    ```
+  - Si `generate_answer: false`, realiza únicamente la recuperación semántica (RAG retrieval) sin invocar al LLM.
+- `GET /api/test/protocols`: lista todos los protocolos indexados en el corpus RAG (archivos en `data/protocols` y protocolos predeterminados).
+- `GET /api/test/protocols/{protocol_id}`: consulta los detalles completos y contenido de un protocolo específico del corpus.
 - `GET /health/live`: comprueba que el proceso responde.
 - `GET /health/ready`: verifica PostgreSQL, Redis y RabbitMQ; responde `503`
   si el servicio aun no termino de iniciar o alguna dependencia no esta lista.
@@ -58,6 +72,7 @@ Fastify.
 
 El servicio acepta estas variables de entorno: `SERVICE_NAME`,
 `SERVICE_PORT`, `DATABASE_URL`, `REDIS_URL`, `RABBITMQ_URL`, `RABBITMQ_QUEUE`,
+`GEMINI_API_KEY`, `GEMINI_MODEL` (por defecto `gemini-2.5-flash`), `PROTOCOLS_DIR` (por defecto `data/protocols`),
 `OTEL_EXPORTER_OTLP_ENDPOINT` y `DEPLOYMENT_ENVIRONMENT`. En Compose, los
 valores de conexion apuntan a los nombres de servicio de la red Docker.
 
