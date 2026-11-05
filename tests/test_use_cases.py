@@ -7,14 +7,23 @@ from application.use_cases import (
     DeleteEvent,
     GetEvent,
     GetProtocol,
+    IngestProtocolFile,
     ListEvents,
     ListItems,
     ListProtocols,
     PublishEvent,
     QueryProtocolsRAG,
     UpdateEvent,
+    _chunk_text,
 )
-from domain.errors import EventNotFound, GeminiServiceError, ProtocolNotFound
+from domain.errors import (
+    DocumentExtractionError,
+    EmbeddingServiceError,
+    EventNotFound,
+    FileTooLargeError,
+    GeminiServiceError,
+    ProtocolNotFound,
+)
 from domain.models import Item, ProtocolDocument, ProtocolSearchResult
 
 
@@ -92,12 +101,31 @@ class FakeProtocolRetriever:
         self.documents = {d.id: d for d in (documents or [])}
         self.last_query = None
         self.last_category = None
+        self.last_replace_source = None
+        self.initialized = False
+
+    async def initialize(self):
+        self.initialized = True
 
     async def list_documents(self):
         return list(self.documents.values())
 
     async def get_document(self, document_id):
         return self.documents.get(document_id)
+
+    async def index_document(self, document):
+        self.documents[document.id] = document
+
+    async def index_documents(self, documents, replace_source=None):
+        self.last_replace_source = replace_source
+        if replace_source:
+            self.documents = {
+                doc_id: doc
+                for doc_id, doc in self.documents.items()
+                if doc.source_file != replace_source
+            }
+        for document in documents:
+            self.documents[document.id] = document
 
     async def search(self, query, limit=5, category=None):
         self.last_query = query
@@ -109,6 +137,46 @@ class FakeProtocolRetriever:
             ProtocolSearchResult(document=d, score=0.95 - (i * 0.1))
             for i, d in enumerate(docs[:limit])
         ]
+
+
+class FakeDocumentExtractor:
+    def __init__(
+        self,
+        title="Documento Extraído",
+        text="Contenido extraído del archivo",
+        doc_type="pdf",
+        meta=None,
+    ):
+        self.title = title
+        self.text = text
+        self.doc_type = doc_type
+        self.meta = meta or {"pages": 1}
+
+    async def extract_content(self, filename, content, mime_type=None):
+        return self.title, self.text, self.doc_type, self.meta
+
+
+class FakeEmbeddingService:
+    def __init__(self, dim=16, model_name="fake-embedding"):
+        self.dim = dim
+        self.model_name = model_name
+        self.embedded_texts = []
+        self.last_task_type = None
+
+    @property
+    def dimension(self):
+        return self.dim
+
+    async def embed_text(self, text, task_type="RETRIEVAL_QUERY"):
+        self.last_task_type = task_type
+        self.embedded_texts.append(text)
+        return [0.1] * self.dim
+
+    async def embed_batch(self, texts, task_type="RETRIEVAL_DOCUMENT"):
+        self.last_task_type = task_type
+        self.embedded_texts.extend(texts)
+        return [[0.1 * (i + 1)] * self.dim for i, _ in enumerate(texts)]
+
 
 
 class FakeLLMService:
@@ -320,6 +388,128 @@ class UseCaseTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ProtocolNotFound):
             await get_uc.execute("inexistente")
+
+    async def test_ingest_protocol_pdf_file_chunks_and_indexes(self):
+        long_content = "Primer párrafo de prueba del protocolo en PDF.\n\n" * 10
+        extractor = FakeDocumentExtractor(
+            title="Manual de Seguridad PDF",
+            text=long_content,
+            doc_type="pdf",
+            meta={"pages": 3},
+        )
+        embedding_service = FakeEmbeddingService()
+        retriever = FakeProtocolRetriever()
+
+        ingest_uc = IngestProtocolFile(extractor, embedding_service, retriever)
+        result = await ingest_uc.execute(
+            filename="manual_seguridad.pdf",
+            content=b"%PDF-mock",
+            category="seguridad",
+        )
+
+        self.assertEqual(result.source_file, "manual_seguridad.pdf")
+        self.assertEqual(result.doc_type, "pdf")
+        self.assertGreater(result.chunks_count, 0)
+        self.assertEqual(len(result.protocol_ids), result.chunks_count)
+        self.assertEqual(len(retriever.documents), result.chunks_count)
+
+        first_doc = list(retriever.documents.values())[0]
+        self.assertEqual(first_doc.doc_type, "pdf")
+        self.assertIsNotNone(first_doc.embedding)
+        self.assertEqual(first_doc.category, "seguridad")
+
+    async def test_ingest_protocol_image_file_indexes_as_image_doc_type(self):
+        extractor = FakeDocumentExtractor(
+            title="Diagrama Red TLS",
+            text="Explicación técnica del flujo TLS entre microservicios y puertos.",
+            doc_type="image",
+            meta={"mime_type": "image/png"},
+        )
+        embedding_service = FakeEmbeddingService()
+        retriever = FakeProtocolRetriever()
+
+        ingest_uc = IngestProtocolFile(extractor, embedding_service, retriever)
+        result = await ingest_uc.execute(
+            filename="diagrama_tls.png",
+            content=b"\x89PNG-mock",
+            category="redes",
+        )
+
+        self.assertEqual(result.doc_type, "image")
+        self.assertEqual(result.chunks_count, 1)
+        doc = list(retriever.documents.values())[0]
+        self.assertEqual(doc.doc_type, "image")
+        self.assertIn("flujo TLS", doc.content)
+
+    def test_chunk_text_splits_within_boundary(self):
+        text = "Bloque de texto A.\n\nBloque de texto B.\n\nBloque de texto C."
+        chunks = _chunk_text(text, chunk_size=30, overlap=5)
+        self.assertGreaterEqual(len(chunks), 2)
+        for chunk in chunks:
+            self.assertTrue(len(chunk) > 0)
+
+    def test_chunk_text_empty_returns_no_chunks(self):
+        self.assertEqual(_chunk_text(""), [])
+        self.assertEqual(_chunk_text("   \n\n  "), [])
+
+    async def test_ingest_replaces_previous_chunks_for_same_source(self):
+        retriever = FakeProtocolRetriever(
+            [
+                ProtocolDocument(
+                    id="old-chunk",
+                    title="Anterior",
+                    content="contenido viejo",
+                    source_file="manual.pdf",
+                )
+            ]
+        )
+        ingest_uc = IngestProtocolFile(
+            FakeDocumentExtractor(text="Contenido nuevo del manual."),
+            FakeEmbeddingService(),
+            retriever,
+        )
+
+        result = await ingest_uc.execute(
+            filename="manual.pdf", content=b"nuevo", category="seguridad"
+        )
+
+        self.assertEqual(retriever.last_replace_source, "manual.pdf")
+        self.assertNotIn("old-chunk", retriever.documents)
+        self.assertEqual(len(retriever.documents), result.chunks_count)
+        self.assertEqual(result.protocol_ids[0].split("-")[0], "file")
+
+    async def test_ingest_rejects_oversized_file(self):
+        ingest_uc = IngestProtocolFile(
+            FakeDocumentExtractor(),
+            FakeEmbeddingService(),
+            FakeProtocolRetriever(),
+            max_file_bytes=4,
+        )
+        with self.assertRaises(FileTooLargeError):
+            await ingest_uc.execute(filename="manual.pdf", content=b"12345")
+
+    async def test_ingest_rejects_empty_extracted_content(self):
+        ingest_uc = IngestProtocolFile(
+            FakeDocumentExtractor(text="   "),
+            FakeEmbeddingService(),
+            FakeProtocolRetriever(),
+        )
+        with self.assertRaises(DocumentExtractionError):
+            await ingest_uc.execute(filename="manual.pdf", content=b"pdf")
+
+    async def test_ingest_rejects_inconsistent_embedding_dimensions(self):
+        class BadEmbeddingService(FakeEmbeddingService):
+            async def embed_batch(self, texts, task_type="RETRIEVAL_DOCUMENT"):
+                return [[0.1] * (self.dim + 1) for _ in texts]
+
+        ingest_uc = IngestProtocolFile(
+            FakeDocumentExtractor(text="Contenido válido."),
+            BadEmbeddingService(),
+            FakeProtocolRetriever(),
+        )
+        with self.assertRaises(EmbeddingServiceError):
+            await ingest_uc.execute(filename="manual.pdf", content=b"pdf")
+
 
 
 
