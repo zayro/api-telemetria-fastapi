@@ -6,13 +6,16 @@ from application.use_cases import (
     CreateItem,
     DeleteEvent,
     GetEvent,
+    GetProtocol,
     ListEvents,
     ListItems,
+    ListProtocols,
     PublishEvent,
+    QueryProtocolsRAG,
     UpdateEvent,
 )
-from domain.errors import EventNotFound
-from domain.models import Item
+from domain.errors import EventNotFound, GeminiServiceError, ProtocolNotFound
+from domain.models import Item, ProtocolDocument, ProtocolSearchResult
 
 
 class FakeRepository:
@@ -82,6 +85,58 @@ class FakeEventsRepository:
 class FailingPublisher:
     async def publish(self, event):
         raise RuntimeError("broker down")
+
+
+class FakeProtocolRetriever:
+    def __init__(self, documents=None):
+        self.documents = {d.id: d for d in (documents or [])}
+        self.last_query = None
+        self.last_category = None
+
+    async def list_documents(self):
+        return list(self.documents.values())
+
+    async def get_document(self, document_id):
+        return self.documents.get(document_id)
+
+    async def search(self, query, limit=5, category=None):
+        self.last_query = query
+        self.last_category = category
+        docs = list(self.documents.values())
+        if category:
+            docs = [d for d in docs if d.category == category]
+        return [
+            ProtocolSearchResult(document=d, score=0.95 - (i * 0.1))
+            for i, d in enumerate(docs[:limit])
+        ]
+
+
+class FakeLLMService:
+    def __init__(self, answer="Respuesta simulada de Gemini basada en protocolos."):
+        self._answer = answer
+        self.last_prompt = None
+        self.last_context = None
+        self.last_temperature = None
+
+    @property
+    def model_name(self):
+        return "gemini-2.5-flash-test"
+
+    async def generate_response(self, prompt, context, temperature=0.2):
+        self.last_prompt = prompt
+        self.last_context = context
+        self.last_temperature = temperature
+        return self._answer
+
+
+class FailingLLMService:
+    @property
+    def model_name(self):
+        return "gemini-error-model"
+
+    async def generate_response(self, prompt, context, temperature=0.2):
+        raise GeminiServiceError("Error simulado de cuota de Gemini", status_code=429)
+
 
 
 class UseCaseTests(unittest.IsolatedAsyncioTestCase):
@@ -164,6 +219,109 @@ class UseCaseTests(unittest.IsolatedAsyncioTestCase):
             await UpdateEvent(repository).execute("missing", "x")
         with self.assertRaises(EventNotFound):
             await DeleteEvent(repository).execute("missing")
+
+    async def test_protocols_rag_query_with_llm_answer(self):
+        doc1 = ProtocolDocument(
+            id="proto-1",
+            title="Protocolo de Incidentes",
+            content="Aislar nodo comprometido y revocar credenciales.",
+            source_file="incidents.md",
+            category="seguridad",
+        )
+        retriever = FakeProtocolRetriever([doc1])
+        llm = FakeLLMService(answer="Para incidentes, aislar el nodo y revocar credenciales.")
+
+        rag_uc = QueryProtocolsRAG(retriever, llm)
+        result = await rag_uc.execute("¿Cómo responder a una brecha?", top_k=2)
+
+        self.assertEqual(result.query, "¿Cómo responder a una brecha?")
+        self.assertEqual(result.model, "gemini-2.5-flash-test")
+        self.assertIn("aislar", result.answer.lower())
+        self.assertEqual(len(result.sources), 1)
+        self.assertEqual(result.sources[0].document.id, "proto-1")
+        self.assertIn("Aislar nodo comprometido", llm.last_prompt)
+
+    async def test_protocols_rag_query_search_only_without_llm(self):
+        doc1 = ProtocolDocument(
+            id="proto-1",
+            title="Protocolo OAuth",
+            content="Tokens JWT con vigencia de 15 min.",
+            source_file="oauth.md",
+            category="seguridad",
+        )
+        retriever = FakeProtocolRetriever([doc1])
+        llm = FakeLLMService()
+
+        rag_uc = QueryProtocolsRAG(retriever, llm)
+        result = await rag_uc.execute("Vigencia de token", top_k=1, generate_answer=False)
+
+        self.assertIsNone(result.answer)
+        self.assertIsNone(result.model)
+        self.assertEqual(len(result.sources), 1)
+        self.assertIsNone(llm.last_prompt)
+
+    async def test_protocols_rag_filter_by_category(self):
+        doc_sec = ProtocolDocument(
+            id="p-sec",
+            title="Seguridad",
+            content="Reglas de firewall.",
+            source_file="sec.md",
+            category="seguridad",
+        )
+        doc_ops = ProtocolDocument(
+            id="p-ops",
+            title="Backups",
+            content="Snapshots diarios.",
+            source_file="ops.md",
+            category="operaciones",
+        )
+        retriever = FakeProtocolRetriever([doc_sec, doc_ops])
+        llm = FakeLLMService()
+
+        rag_uc = QueryProtocolsRAG(retriever, llm)
+        result = await rag_uc.execute("Snapshots", category="operaciones")
+
+        self.assertEqual(len(result.sources), 1)
+        self.assertEqual(result.sources[0].document.category, "operaciones")
+
+    async def test_protocols_rag_propagates_gemini_service_error(self):
+        doc = ProtocolDocument(
+            id="p-1",
+            title="TLS",
+            content="TLS 1.3 requerido.",
+            source_file="tls.md",
+            category="redes",
+        )
+        retriever = FakeProtocolRetriever([doc])
+        llm = FailingLLMService()
+
+        rag_uc = QueryProtocolsRAG(retriever, llm)
+        with self.assertRaises(GeminiServiceError):
+            await rag_uc.execute("Requisitos de cifrado")
+
+    async def test_list_and_get_protocols(self):
+        doc = ProtocolDocument(
+            id="p-abc",
+            title="Protocolo Alpha",
+            content="Contenido técnico.",
+            source_file="alpha.md",
+            category="general",
+        )
+        retriever = FakeProtocolRetriever([doc])
+
+        list_uc = ListProtocols(retriever)
+        docs = await list_uc.execute()
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0].id, "p-abc")
+
+        get_uc = GetProtocol(retriever)
+        retrieved_doc = await get_uc.execute("p-abc")
+        self.assertEqual(retrieved_doc.title, "Protocolo Alpha")
+
+        with self.assertRaises(ProtocolNotFound):
+            await get_uc.execute("inexistente")
+
+
 
 
 if __name__ == "__main__":
