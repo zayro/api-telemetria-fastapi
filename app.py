@@ -20,6 +20,7 @@ from application.use_cases import (
     DeleteEvent,
     GetEvent,
     GetProtocol,
+    IngestProtocolFile,
     ListEvents,
     ListItems,
     ListProtocols,
@@ -30,9 +31,12 @@ from application.use_cases import (
 )
 from infrastructure.adapters import (
     CorpusProtocolRetriever,
+    GeminiEmbeddingAdapter,
     GeminiLLMAdapter,
+    MultimodalDocumentExtractor,
     PostgresEventsRepository,
     PostgresItemsRepository,
+    PostgresProtocolIndexRepository,
     RabbitMQEventPublisher,
     RedisItemsCache,
 )
@@ -46,7 +50,12 @@ RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://app:app@rabbitmq:5672/")
 RABBITMQ_QUEUE = os.getenv("RABBITMQ_QUEUE", "test.events")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_EMBEDDING_MODEL = os.getenv(
+    "GEMINI_EMBEDDING_MODEL", "gemini-embedding-001"
+)
+GEMINI_EMBEDDING_DIM = int(os.getenv("GEMINI_EMBEDDING_DIM", "768"))
 PROTOCOLS_DIR = os.getenv("PROTOCOLS_DIR", "data/protocols")
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 
 
 @dataclass
@@ -62,6 +71,7 @@ class ServiceContainer:
     query_protocols_rag: QueryProtocolsRAG
     list_protocols: ListProtocols
     get_protocol: GetProtocol
+    ingest_protocol_file: IngestProtocolFile
 
 async def connect_rabbitmq(url: str, logger: logging.Logger) -> aio_pika.RobustConnection:
     while True:
@@ -80,7 +90,10 @@ def create_app() -> FastAPI:
         "rabbitmq_queue": RABBITMQ_QUEUE,
         "gemini_api_key": GEMINI_API_KEY,
         "gemini_model": GEMINI_MODEL,
+        "gemini_embedding_model": GEMINI_EMBEDDING_MODEL,
+        "gemini_embedding_dim": GEMINI_EMBEDDING_DIM,
         "protocols_dir": PROTOCOLS_DIR,
+        "max_upload_bytes": MAX_UPLOAD_BYTES,
     }
     tracer, logger = setup_telemetry(SERVICE_NAME)
 
@@ -123,12 +136,38 @@ def create_app() -> FastAPI:
                 settings["rabbitmq_queue"],
                 tracer,
             )
-            retriever = CorpusProtocolRetriever(settings["protocols_dir"], tracer)
             gemini_client = GeminiLLMAdapter(
                 api_key=settings["gemini_api_key"],
                 model_name=settings["gemini_model"],
                 tracer=tracer,
                 logger=logger,
+            )
+            embedding_client = GeminiEmbeddingAdapter(
+                api_key=settings["gemini_api_key"],
+                model_name=settings["gemini_embedding_model"],
+                output_dimensionality=settings["gemini_embedding_dim"],
+                tracer=tracer,
+                logger=logger,
+            )
+            extractor = MultimodalDocumentExtractor(gemini_client, logger=logger)
+            index_repository = PostgresProtocolIndexRepository(
+                pool, tracer=tracer, logger=logger
+            )
+            await index_repository.ensure_schema()
+            retriever = CorpusProtocolRetriever(
+                protocols_dir=settings["protocols_dir"],
+                tracer=tracer,
+                embedding_service=embedding_client,
+                extractor=extractor,
+                index_repository=index_repository,
+                logger=logger,
+            )
+            await retriever.initialize()
+            ingest_protocol_file = IngestProtocolFile(
+                extractor=extractor,
+                embedding_service=embedding_client,
+                retriever=retriever,
+                max_file_bytes=settings["max_upload_bytes"],
             )
             app.state.container = ServiceContainer(
                 simulate_test=SimulateTest(),
@@ -142,6 +181,7 @@ def create_app() -> FastAPI:
                 query_protocols_rag=QueryProtocolsRAG(retriever, gemini_client),
                 list_protocols=ListProtocols(retriever),
                 get_protocol=GetProtocol(retriever),
+                ingest_protocol_file=ingest_protocol_file,
             )
             app.state.pool = pool
             app.state.redis = redis_client
