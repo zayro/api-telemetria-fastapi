@@ -12,6 +12,16 @@ DURATION = Histogram(
     "Duracion de solicitudes HTTP del app",
     ["service", "route"],
 )
+PUBLISHED = Counter(
+    "app_messaging_published_total",
+    "Publicaciones Kafka confirmadas o fallidas",
+    ["topic", "outcome"],
+)
+PUBLISH_DURATION = Histogram(
+    "app_messaging_publish_duration_seconds",
+    "Tiempo de publicacion Kafka hasta confirmacion del broker",
+    ["topic"],
+)
 
 
 def record_request(service_name: str, route: str, status: int, started: float) -> None:

@@ -1,10 +1,11 @@
 import asyncio
-import logging
 import os
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 
-import aio_pika
+from aiokafka import AIOKafkaConsumer
+from aiokafka import AIOKafkaProducer
+from aiokafka.admin import AIOKafkaAdminClient
 import redis.asyncio as redis
 import uvicorn
 from fastapi import FastAPI
@@ -37,7 +38,7 @@ from infrastructure.adapters import (
     PostgresEventsRepository,
     PostgresItemsRepository,
     PostgresProtocolIndexRepository,
-    RabbitMQEventPublisher,
+    KafkaEventPublisher,
     RedisItemsCache,
 )
 from telemetry import setup_telemetry, structured_log
@@ -46,8 +47,21 @@ SERVICE_NAME = os.getenv("SERVICE_NAME", "test-fastapi-service")
 PORT = int(os.getenv("SERVICE_PORT", "8083"))
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://app:app@postgres:5432/app")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://app:app@rabbitmq:5672/")
-RABBITMQ_QUEUE = os.getenv("RABBITMQ_QUEUE", "test.events")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "test.events")
+KAFKA_CONSUMER_ENABLED = os.getenv("KAFKA_CONSUMER_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+KAFKA_CONSUMER_GROUP_ID = os.getenv(
+    "KAFKA_CONSUMER_GROUP_ID", f"{SERVICE_NAME}-consumer"
+)
+KAFKA_CONSUMER_TOPICS = [
+    topic.strip()
+    for topic in os.getenv("KAFKA_CONSUMER_TOPICS", KAFKA_TOPIC).split(",")
+    if topic.strip()
+] or [KAFKA_TOPIC]
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_EMBEDDING_MODEL = os.getenv(
@@ -73,21 +87,13 @@ class ServiceContainer:
     get_protocol: GetProtocol
     ingest_protocol_file: IngestProtocolFile
 
-async def connect_rabbitmq(url: str, logger: logging.Logger) -> aio_pika.RobustConnection:
-    while True:
-        try:
-            return await aio_pika.connect_robust(url)
-        except aio_pika.exceptions.AMQPConnectionError as exc:
-            structured_log(logger, "rabbitmq_connect_retry", error=str(exc))
-            await asyncio.sleep(2)
-
 
 def create_app() -> FastAPI:
     settings = {
         "database_url": DATABASE_URL,
         "redis_url": REDIS_URL,
-        "rabbitmq_url": RABBITMQ_URL,
-        "rabbitmq_queue": RABBITMQ_QUEUE,
+        "kafka_bootstrap_servers": KAFKA_BOOTSTRAP_SERVERS,
+        "kafka_topic": KAFKA_TOPIC,
         "gemini_api_key": GEMINI_API_KEY,
         "gemini_model": GEMINI_MODEL,
         "gemini_embedding_model": GEMINI_EMBEDDING_MODEL,
@@ -97,14 +103,48 @@ def create_app() -> FastAPI:
     }
     tracer, logger = setup_telemetry(SERVICE_NAME)
 
+    async def _consume_kafka_messages(consumer: AIOKafkaConsumer) -> None:
+        """Loop de consumo (apagado por defecto) para tenerlo listo cuando se necesite."""
+        structured_log(
+            logger,
+            "kafka_consumer_started",
+            topics=KAFKA_CONSUMER_TOPICS,
+            group_id=KAFKA_CONSUMER_GROUP_ID,
+        )
+        try:
+            async for message in consumer:
+                # Placeholder: aquÃƒÂ­ normalmente se harÃƒÂ­a dispatch a un handler/use-case
+                structured_log(
+                    logger,
+                    "kafka_message_received",
+                    topic=message.topic,
+                    partition=message.partition,
+                    offset=message.offset,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            structured_log(
+                logger,
+                "kafka_consumer_failed",
+                error=str(exc),
+            )
+            raise
+        finally:
+            structured_log(logger, "kafka_consumer_stopped")
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Mantiene readiness desactivado hasta completar toda la inicialización.
         app.state.ready = False
+        # Libera los recursos en orden inverso al registro, incluso si falla el arranque.
         async with AsyncExitStack() as stack:
+            # Espera a que PostgreSQL tenga conexiones disponibles antes de continuar.
             pool = AsyncConnectionPool(settings["database_url"], open=False)
             await pool.open(wait=True)
             stack.push_async_callback(pool.close)
 
+            # Crea las tablas de negocio si todavía no existen.
             async with pool.connection() as conn:
                 await conn.execute(
                     "CREATE TABLE IF NOT EXISTS test_items ("
@@ -120,22 +160,68 @@ def create_app() -> FastAPI:
                     "updated_at TIMESTAMPTZ)"
                 )
 
+            # Comparte un cliente Redis; la conexión se establece al usarlo.
             redis_client = redis.from_url(settings["redis_url"], decode_responses=True)
             stack.push_async_callback(redis_client.aclose)
 
-            rabbit_connection = await connect_rabbitmq(settings["rabbitmq_url"], logger)
-            stack.push_async_callback(rabbit_connection.close)
-            rabbit_channel = await rabbit_connection.channel(publisher_confirms=True)
-            await rabbit_channel.declare_queue(settings["rabbitmq_queue"], durable=True)
+            # Inicia el productor Kafka con idempotencia y confirmación de todas las réplicas ISR.
+            producer = AIOKafkaProducer(
+                bootstrap_servers=settings["kafka_bootstrap_servers"].split(","),
+                client_id=SERVICE_NAME,
+                enable_idempotence=True,
+                acks="all",
+            )
+            stack.push_async_callback(producer.stop)
+            await producer.start()
 
+            # El consumo en segundo plano solo se inicia si está habilitado por configuración.
+            consumer_task: asyncio.Task | None = None
+            consumer: AIOKafkaConsumer | None = None
+            if KAFKA_CONSUMER_ENABLED:
+                consumer = AIOKafkaConsumer(
+                    *KAFKA_CONSUMER_TOPICS,
+                    bootstrap_servers=settings["kafka_bootstrap_servers"].split(","),
+                    client_id=f"{SERVICE_NAME}-consumer",
+                    group_id=KAFKA_CONSUMER_GROUP_ID,
+                    enable_auto_commit=True,
+                    auto_offset_reset="earliest",
+                )
+                stack.push_async_callback(consumer.stop)
+                await consumer.start()
+                consumer_task = asyncio.create_task(
+                    _consume_kafka_messages(consumer),
+                    name=f"{SERVICE_NAME}-kafka-consumer",
+                )
+
+                async def _stop_consumer_task() -> None:
+                    # Cancela y espera el bucle antes de cerrar el cliente consumidor.
+                    if consumer_task is None:
+                        return
+                    consumer_task.cancel()
+                    try:
+                        await consumer_task
+                    except asyncio.CancelledError:
+                        pass
+
+                stack.push_async_callback(_stop_consumer_task)
+            # Usa un cliente administrativo independiente para comprobar Kafka en readiness.
+            kafka_admin = AIOKafkaAdminClient(
+                bootstrap_servers=settings["kafka_bootstrap_servers"].split(","),
+                client_id=f"{SERVICE_NAME}-health",
+            )
+            stack.push_async_callback(kafka_admin.close)
+            await kafka_admin.start()
+
+            # Construye los adaptadores compartidos por los casos de uso.
             repository = PostgresItemsRepository(pool, tracer, logger)
             events_repository = PostgresEventsRepository(pool, tracer, logger)
             cache = RedisItemsCache(redis_client, tracer)
-            publisher = RabbitMQEventPublisher(
-                rabbit_channel,
-                settings["rabbitmq_queue"],
+            publisher = KafkaEventPublisher(
+                producer,
+                settings["kafka_topic"],
                 tracer,
             )
+            # Configura la generación de respuestas, los embeddings y la extracción documental.
             gemini_client = GeminiLLMAdapter(
                 api_key=settings["gemini_api_key"],
                 model_name=settings["gemini_model"],
@@ -153,6 +239,7 @@ def create_app() -> FastAPI:
             index_repository = PostgresProtocolIndexRepository(
                 pool, tracer=tracer, logger=logger
             )
+            # Prepara la persistencia del índice antes de cargar el corpus de protocolos.
             await index_repository.ensure_schema()
             retriever = CorpusProtocolRetriever(
                 protocols_dir=settings["protocols_dir"],
@@ -162,6 +249,7 @@ def create_app() -> FastAPI:
                 index_repository=index_repository,
                 logger=logger,
             )
+            # Recupera el índice persistido e incorpora los documentos nuevos o modificados.
             await retriever.initialize()
             ingest_protocol_file = IngestProtocolFile(
                 extractor=extractor,
@@ -169,6 +257,7 @@ def create_app() -> FastAPI:
                 retriever=retriever,
                 max_file_bytes=settings["max_upload_bytes"],
             )
+            # Publica los casos de uso para que las dependencias HTTP puedan resolverlos.
             app.state.container = ServiceContainer(
                 simulate_test=SimulateTest(),
                 create_item=CreateItem(repository, cache),
@@ -183,13 +272,18 @@ def create_app() -> FastAPI:
                 get_protocol=GetProtocol(retriever),
                 ingest_protocol_file=ingest_protocol_file,
             )
+            # Expone los clientes que necesitan las comprobaciones de salud del servicio.
             app.state.pool = pool
             app.state.redis = redis_client
-            app.state.rabbit_connection = rabbit_connection
+            app.state.kafka_producer = producer
+            app.state.kafka_consumer = consumer
+            app.state.kafka_admin = kafka_admin
             app.state.ready = True
             try:
+                # Entrega el control a FastAPI mientras la aplicación atiende peticiones.
                 yield
             finally:
+                # Desactiva readiness antes de que AsyncExitStack cierre los recursos.
                 app.state.ready = False
 
     app = FastAPI(title=SERVICE_NAME, lifespan=lifespan)
@@ -218,8 +312,12 @@ def create_app() -> FastAPI:
             async with app.state.pool.connection() as conn:
                 await conn.execute("SELECT 1")
             await app.state.redis.ping()
-            if app.state.rabbit_connection.is_closed:
-                raise RuntimeError("RabbitMQ connection is closed")
+            topics = await asyncio.wait_for(
+                app.state.kafka_admin.describe_topics([settings["kafka_topic"]]),
+                timeout=3,
+            )
+            if not topics or topics[0].get("error_code") or not topics[0].get("partitions"):
+                raise RuntimeError("Kafka topic unavailable")
         except Exception as exc:
             structured_log(logger, "readiness_check_failed", error=str(exc))
             return JSONResponse(

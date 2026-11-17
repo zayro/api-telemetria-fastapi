@@ -16,11 +16,6 @@ from datetime import datetime
 from pathlib import Path
 
 try:
-    import aio_pika
-except ImportError:
-    aio_pika = None
-
-try:
     from opentelemetry import propagate, trace
 except ImportError:
     propagate = None
@@ -228,36 +223,45 @@ class RedisItemsCache:
         await self._client.delete(CACHE_KEY)
 
 
-class RabbitMQEventPublisher:
+class KafkaEventPublisher:
     def __init__(
         self,
-        channel: aio_pika.abc.AbstractChannel,
-        queue_name: str,
+        producer,
+        topic: str,
         tracer: trace.Tracer,
     ):
-        self._channel = channel
-        self._queue_name = queue_name
+        self._producer = producer
+        self._topic = topic
         self._tracer = tracer
 
     async def publish(self, event: Event) -> None:
+        from app_metrics import PUBLISHED, PUBLISH_DURATION
+
         payload = json.dumps(
             {"event_id": event.event_id, "name": event.name},
             separators=(",", ":"),
         ).encode()
-        with self._tracer.start_as_current_span("test.rabbitmq_publish") as span:
-            span.set_attribute("messaging.system", "rabbitmq")
-            span.set_attribute("messaging.destination.name", self._queue_name)
+        with self._tracer.start_as_current_span(
+            "test.kafka_publish", kind=trace.SpanKind.PRODUCER
+        ) as span:
+            span.set_attribute("messaging.system", "kafka")
+            span.set_attribute("messaging.destination.name", self._topic)
+            span.set_attribute("messaging.operation.type", "send")
+            span.set_attribute("messaging.message.id", event.event_id)
             headers = {}
             propagate.inject(headers)
-            await self._channel.default_exchange.publish(
-                aio_pika.Message(
-                    body=payload,
-                    headers=headers,
-                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                    content_type="application/json",
-                ),
-                routing_key=self._queue_name,
-            )
+            with PUBLISH_DURATION.labels(self._topic).time():
+                try:
+                    await self._producer.send_and_wait(
+                        self._topic,
+                        value=payload,
+                        key=event.event_id.encode(),
+                        headers=[(key, value.encode()) for key, value in headers.items()],
+                    )
+                    PUBLISHED.labels(self._topic, "success").inc()
+                except Exception:
+                    PUBLISHED.labels(self._topic, "error").inc()
+                    raise
 
 
 def _tokenize(text: str) -> list[str]:

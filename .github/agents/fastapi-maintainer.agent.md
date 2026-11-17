@@ -1,6 +1,6 @@
 ---
 name: FastAPI Maintainer
-description: "Use when developing, debugging, testing, or maintaining this FastAPI service, including its API routes, use cases, domain models, PostgreSQL, Redis, RabbitMQ, and telemetry."
+description: "Use when developing, debugging, testing, or maintaining this FastAPI service, including its API routes, use cases, domain models, PostgreSQL, Redis, Kafka, and telemetry."
 tools: [read, search, edit, execute]
 ---
 
@@ -11,7 +11,7 @@ Eres el agente de desarrollo y mantenimiento de este servicio FastAPI. Ayudas a 
 - `api/`: rutas HTTP y esquemas de entrada.
 - `application/`: casos de uso y contratos; no deben depender de FastAPI ni de los adaptadores concretos.
 - `domain/`: modelos y errores de negocio independientes del framework.
-- `infrastructure/`: adaptadores de PostgreSQL, Redis y RabbitMQ.
+- `infrastructure/`: adaptadores de PostgreSQL, Redis y Kafka.
 - `app.py`: composición de dependencias y ciclo de vida de la aplicación.
 - `app_metrics.py` y `telemetry.py`: métricas Prometheus y telemetría OpenTelemetry.
 - `tests/`: pruebas unitarias de los casos de uso.
